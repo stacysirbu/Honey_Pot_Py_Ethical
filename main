@@ -1,0 +1,167 @@
+import socket
+import threading
+import paramiko
+from datetime import datetime
+import re
+
+HOST = '0.0.0.0'
+PORT = 2222  # Avoid root privilege port
+
+LOGFILE = 'ssh_honeypot.log'
+BLACKLIST_FILE = 'blacklist.txt'
+
+# Regex patterns for malware/backdoor indicators
+BASE64_PATTERN = re.compile(r'([A-Za-z0-9+/]{40,}={0,2})')
+CHAINING_PATTERN = re.compile(r'[;&|]{1,2}')
+DOWNLOAD_PATTERN = re.compile(r'(wget|curl).*(http|https)://\S+')
+CHMOD_PATTERN = re.compile(r'chmod\s+[0-7]{3,4}\s+\S+')
+REVERSE_SHELL_PATTERN = re.compile(
+    r'(bash\s+-i|nc\s+-e|mkfifo\s+/tmp/|/dev/tcp/)'
+)
+
+# Suspicious keywords
+MALWARE_INDICATORS = [
+    'wget', 'curl', 'nc', 'netcat', 'bash', 'sh', 'python', 'perl', 'scp', 'ftp', 'telnet',
+    'nmap', 'masscan', 'tcpdump', 'chmod', 'chown', 'kill', 'killall', 'rm', 'base64',
+    'openssl', 'socat', 'ps', 'netstat', 'crontab', 'service', 'systemctl', 'iptables',
+    'mount', 'echo', 'export', 'sudo'
+]
+
+# Fake shell responses
+FAKE_RESPONSES = {
+    'ls': 'bin  etc  home  usr  var\n',
+    'pwd': '/home/fakeuser\n',
+    'whoami': 'fakeuser\n',
+    'id': 'uid=1000(fakeuser) gid=1000(fakeuser) groups=1000(fakeuser)\n',
+    'uname -a': 'Linux fakehost 5.15.0-100-generic #100-Ubuntu SMP Fri Apr 2 12:00:00 UTC 2025 x86_64 GNU/Linux\n',
+    'cat /etc/passwd': 'root:x:0:0:root:/root:/bin/bash\nfakeuser:x:1000:1000::/home/fakeuser:/bin/bash\n',
+    'who': 'fakeuser pts/0 2025-05-28 12:00 (192.168.1.100)\n',
+    'uptime': ' 12:00:00 up 10 days,  4:12,  1 user,  load average: 0.00, 0.01, 0.05\n',
+    'help': 'Supported commands: ls, pwd, whoami, id, uname -a, cat /etc/passwd, who, uptime\n',
+}
+
+def log_event(event):
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with open(LOGFILE, 'a') as f:
+        f.write(f"{timestamp} - {event}\n")
+    print(f"{timestamp} - {event}")
+
+def load_blacklist():
+    try:
+        with open(BLACKLIST_FILE, 'r') as f:
+            return set(line.strip() for line in f if line.strip())
+    except FileNotFoundError:
+        return set()
+
+def add_to_blacklist(ip):
+    blacklist = load_blacklist()
+    if ip not in blacklist:
+        with open(BLACKLIST_FILE, 'a') as f:
+            f.write(ip + '\n')
+        log_event(f"IP {ip} added to blacklist")
+
+def detect_and_log_behavior(command_str, client_ip):
+    command_lower = command_str.lower()
+    log_event(f"[{client_ip}] Command received: {command_str}")
+
+    # Check keyword indicators
+    for keyword in MALWARE_INDICATORS:
+        if keyword in command_lower:
+            log_event(f"[{client_ip}] MALWARE/Backdoor indicator detected (keyword): '{command_str}'")
+            break
+
+    # Regex checks
+    if BASE64_PATTERN.search(command_str):
+        log_event(f"[{client_ip}] MALWARE/Backdoor indicator detected (base64 string): '{command_str}'")
+    if CHAINING_PATTERN.search(command_str):
+        log_event(f"[{client_ip}] MALWARE/Backdoor indicator detected (command chaining): '{command_str}'")
+    if DOWNLOAD_PATTERN.search(command_str):
+        log_event(f"[{client_ip}] MALWARE/Backdoor indicator detected (file download): '{command_str}'")
+    if CHMOD_PATTERN.search(command_str):
+        log_event(f"[{client_ip}] MALWARE/Backdoor indicator detected (chmod use): '{command_str}'")
+    if REVERSE_SHELL_PATTERN.search(command_str):
+        log_event(f"[{client_ip}] MALWARE/Backdoor indicator detected (reverse shell): '{command_str}'")
+
+class SSHHoneypot(paramiko.ServerInterface):
+    def check_auth_password(self, username, password):
+        log_event(f"Auth attempt - Username: '{username}' | Password: '{password}'")
+        return paramiko.AUTH_SUCCESSFUL  # Accept all creds
+
+    def get_allowed_auths(self, username):
+        return "password"
+
+    def check_channel_request(self, kind, chanid):
+        if kind == 'session':
+            return paramiko.OPEN_SUCCEEDED
+        return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+
+    def check_channel_shell_request(self, channel):
+        return True
+
+def handle_client(client_socket, client_address):
+    client_ip = client_address[0]
+    suspicious_command_count = 0
+
+    try:
+        key = paramiko.RSAKey.generate(2048)
+        transport = paramiko.Transport(client_socket)
+        transport.add_server_key(key)
+        server = SSHHoneypot()
+        transport.start_server(server=server)
+
+        chan = transport.accept(20)
+        if chan is None:
+            log_event(f"Failed to open channel from {client_ip}")
+            return
+
+        chan.send("Welcome to the fake SSH server.\nAll activity is monitored.\n")
+
+        while True:
+            command = chan.recv(1024)
+            if not command:
+                break
+
+            command_str = command.decode('utf-8', errors='ignore').strip()
+            detect_and_log_behavior(command_str, client_ip)
+
+            # Increase suspicious count if malware indicator present
+            if any(keyword in command_str.lower() for keyword in MALWARE_INDICATORS):
+                suspicious_command_count += 1
+
+            if suspicious_command_count >= 5:
+                add_to_blacklist(client_ip)
+                chan.send("Too many suspicious commands. Disconnecting.\n")
+                break
+
+            response = FAKE_RESPONSES.get(command_str, f"bash: {command_str}: command not found\n")
+            chan.send(response)
+
+    except Exception as e:
+        log_event(f"Error handling client {client_ip}: {e}")
+
+    finally:
+        client_socket.close()
+
+def start_honeypot():
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.bind((HOST, PORT))
+    server_socket.listen(100)
+    log_event(f"Honeypot started on {HOST}:{PORT}")
+
+    blacklist = load_blacklist()
+
+    while True:
+        client, addr = server_socket.accept()
+        client_ip = addr[0]
+
+        if client_ip in blacklist:
+            log_event(f"Blocked connection attempt from blacklisted IP {client_ip}")
+            client.close()
+            continue
+
+        log_event(f"New connection from {client_ip}:{addr[1]}")
+        thread = threading.Thread(target=handle_client, args=(client, addr))
+        thread.start()
+
+if __name__ == "__main__":
+    start_honeypot()

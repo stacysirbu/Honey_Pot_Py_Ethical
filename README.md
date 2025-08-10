@@ -1,3 +1,8 @@
+⚠️ DISCLAIMER: This project is for educational purposes only. It is intended to demonstrate how a honeypot works in a controlled, ethical environment. The author is not responsible for any misuse.
+
+This project is part of a cybersecurity learning journey. It is intended to demonstrate how keylogging works so defenders can better detect and prevent it. Unauthorized use of this tool violates laws and GitHub's Acceptable Use Policies.
+
+
 # 🎯 HoneyPotPy — Python Honeypot for Cybersecurity Training
 
 A Python-based **low-interaction honeypot** designed to detect, log, and analyze unauthorized access attempts.  

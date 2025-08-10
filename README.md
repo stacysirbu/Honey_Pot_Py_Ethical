@@ -47,5 +47,4 @@ By simulating a target, defenders can log every move the adversary makes — wit
 
 ---
 
-   git clone https://github.com/YourUser/HoneyPotPy.git
-   cd HoneyPotPy
+
